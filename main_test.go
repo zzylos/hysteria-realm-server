@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -584,11 +587,39 @@ func TestPerIPRealmLimitViaProxyHeader(t *testing.T) {
 	if c := registerWith(t, s, "a", "10.0.0.1:1", "X-Forwarded-For", "203.0.113.5"); c != http.StatusOK {
 		t.Fatalf("a = %d", c)
 	}
-	if c := registerWith(t, s, "b", "10.0.0.1:1", "X-Forwarded-For", "203.0.113.5, 10.0.0.1"); c != http.StatusTooManyRequests {
+	// The proxy appends the address it saw, so the rightmost entry is the
+	// client. Whatever the client put further left does not matter.
+	if c := registerWith(t, s, "b", "10.0.0.1:1", "X-Forwarded-For", "198.51.100.1, 203.0.113.5"); c != http.StatusTooManyRequests {
 		t.Fatalf("b = %d, want 429", c)
 	}
-	if c := registerWith(t, s, "c", "10.0.0.1:1", "X-Forwarded-For", "203.0.113.6"); c != http.StatusOK {
+	if c := registerWith(t, s, "c", "10.0.0.1:1", "X-Forwarded-For", "203.0.113.5, 203.0.113.6"); c != http.StatusOK {
 		t.Fatalf("c = %d", c)
+	}
+}
+
+func TestPerIPRealmLimitViaProxyHeaderWithTrustedProxies(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{
+		maxRealmsPerIP: 1,
+		proxyHeader:    "X-Forwarded-For",
+		trustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	})
+
+	// Two proxy hops: the client's address is the rightmost one that is
+	// not a trusted proxy.
+	if c := registerWith(t, s, "a", "10.0.0.1:1", "X-Forwarded-For", "203.0.113.5, 10.0.0.2"); c != http.StatusOK {
+		t.Fatalf("a = %d", c)
+	}
+	if c := registerWith(t, s, "b", "10.0.0.1:1", "X-Forwarded-For", "1.1.1.1, 203.0.113.5, 10.0.0.2"); c != http.StatusTooManyRequests {
+		t.Fatalf("b = %d, want 429", c)
+	}
+	// A request that does not come from a trusted proxy cannot pick its
+	// address with the header.
+	if c := registerWith(t, s, "c", "203.0.113.9:1", "X-Forwarded-For", "198.51.100.7"); c != http.StatusOK {
+		t.Fatalf("c = %d", c)
+	}
+	if c := registerWith(t, s, "d", "203.0.113.9:1", "X-Forwarded-For", "198.51.100.8"); c != http.StatusTooManyRequests {
+		t.Fatalf("d = %d, want 429 (header from an untrusted peer must be ignored)", c)
 	}
 }
 
@@ -668,19 +699,27 @@ func TestRealmNameCustomPattern(t *testing.T) {
 
 func TestGetenvBool(t *testing.T) {
 	t.Setenv("HYSTERIA_REALM_DEBUG_TEST", "true")
-	if !getenvBool("HYSTERIA_REALM_DEBUG_TEST", false) {
-		t.Fatal("expected true")
+	if b, err := getenvBool("HYSTERIA_REALM_DEBUG_TEST", false); err != nil || !b {
+		t.Fatalf("got %v, %v; want true", b, err)
 	}
 	t.Setenv("HYSTERIA_REALM_DEBUG_TEST", "1")
-	if !getenvBool("HYSTERIA_REALM_DEBUG_TEST", false) {
-		t.Fatal("expected true for 1")
+	if b, err := getenvBool("HYSTERIA_REALM_DEBUG_TEST", false); err != nil || !b {
+		t.Fatalf("got %v, %v; want true for 1", b, err)
+	}
+	t.Setenv("HYSTERIA_REALM_DEBUG_TEST", "Yes")
+	if b, err := getenvBool("HYSTERIA_REALM_DEBUG_TEST", false); err != nil || !b {
+		t.Fatalf("got %v, %v; want true for Yes", b, err)
+	}
+	t.Setenv("HYSTERIA_REALM_DEBUG_TEST", "off")
+	if b, err := getenvBool("HYSTERIA_REALM_DEBUG_TEST", true); err != nil || b {
+		t.Fatalf("got %v, %v; want false for off", b, err)
 	}
 	t.Setenv("HYSTERIA_REALM_DEBUG_TEST", "nope")
-	if !getenvBool("HYSTERIA_REALM_DEBUG_TEST", true) {
-		t.Fatal("expected default for invalid bool")
+	if _, err := getenvBool("HYSTERIA_REALM_DEBUG_TEST", true); err == nil {
+		t.Fatal("expected an error for an invalid bool")
 	}
-	if getenvBool("HYSTERIA_REALM_DEBUG_TEST_UNSET", false) {
-		t.Fatal("expected default false for unset")
+	if b, err := getenvBool("HYSTERIA_REALM_DEBUG_TEST_UNSET", false); err != nil || b {
+		t.Fatalf("got %v, %v; want default false for unset", b, err)
 	}
 	_ = os.Unsetenv("HYSTERIA_REALM_DEBUG_TEST_UNSET")
 }
@@ -747,6 +786,500 @@ func TestParseConfigFlagsOverrideEnv(t *testing.T) {
 	}
 }
 
+func TestNewEventStreamReplacesOldOne(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{})
+	sid := registerRealm(t, s, "example")
+
+	oldRec := newFlushRecorder()
+	cancelOld, oldDone := openEvents(t, s, "example", sid, oldRec, oldRec)
+	defer cancelOld()
+	newRec := newFlushRecorder()
+	cancelNew, newDone := openEvents(t, s, "example", sid, newRec, newRec)
+	defer cancelNew()
+
+	// The old stream's client never disconnected, as with a connection
+	// that died silently. The new stream still takes over.
+	waitClosed(t, oldDone, "the replaced stream to stop")
+
+	if resp := doRequest(t, s, http.MethodPost, "/v1/example/connect", testRealmToken, connectBody(testNonce)); resp.Code != http.StatusOK {
+		t.Fatalf("connect status = %d", resp.Code)
+	}
+	if resp := doRequest(t, s, http.MethodPost, "/v1/example/heartbeat", sid, map[string]any{}); resp.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d", resp.Code)
+	}
+	waitForBody(t, newRec, "event: punch", 1)
+	waitForBody(t, newRec, "event: heartbeat_ack", 1)
+	if body := oldRec.body(); strings.Contains(body, "event:") {
+		t.Fatalf("replaced stream received events: %q", body)
+	}
+	cancelNew()
+	waitClosed(t, newDone, "the stream to stop")
+}
+
+func TestHeartbeatAcksDoNotFillEventBuffer(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{})
+	sid := registerRealm(t, s, "example")
+
+	// With no stream reading, acks used to pile up in the event buffer
+	// until every connect failed with 503.
+	for i := 0; i < 2*eventsBufferSize; i++ {
+		if resp := doRequest(t, s, http.MethodPost, "/v1/example/heartbeat", sid, map[string]any{}); resp.Code != http.StatusOK {
+			t.Fatalf("heartbeat %d status = %d", i, resp.Code)
+		}
+	}
+	if resp := doRequest(t, s, http.MethodPost, "/v1/example/connect", testRealmToken, connectBody(testNonce)); resp.Code != http.StatusOK {
+		t.Fatalf("connect status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	rec := newFlushRecorder()
+	cancel, done := openEvents(t, s, "example", sid, rec, rec)
+	waitForBody(t, rec, "event: punch", 1)
+	waitForBody(t, rec, "event: heartbeat_ack", 1)
+	cancel()
+	waitClosed(t, done, "the stream to stop")
+	if n := strings.Count(rec.Body.String(), "event: heartbeat_ack"); n != 1 {
+		t.Fatalf("got %d heartbeat_ack events, want 1", n)
+	}
+}
+
+func TestStalePunchEventsAreDropped(t *testing.T) {
+	realmToken = testRealmToken
+	oldMaxAge := punchEventMaxAge
+	punchEventMaxAge = 10 * time.Millisecond
+	t.Cleanup(func() { punchEventMaxAge = oldMaxAge })
+	s := newServer(serverConfig{})
+	sid := registerRealm(t, s, "example")
+
+	// Nobody is listening, so the connect times out and its punch event
+	// waits in the queue until it is older than punchEventMaxAge.
+	if resp := doRequest(t, s, http.MethodPost, "/v1/example/connect", testRealmToken, connectBody(testNonce)); resp.Code != http.StatusOK {
+		t.Fatalf("connect status = %d", resp.Code)
+	}
+	s.mu.Lock()
+	sess := s.realms["example"]
+	s.mu.Unlock()
+
+	rec := newFlushRecorder()
+	cancel, done := openEvents(t, s, "example", sid, rec, rec)
+	waitFor(t, func() bool { return len(sess.events) == 0 }, "the stream to take the queued event")
+	// The stream handles events in order, so once this ack is written the
+	// punch event has been dealt with.
+	doRequest(t, s, http.MethodPost, "/v1/example/heartbeat", sid, map[string]any{})
+	waitForBody(t, rec, "event: heartbeat_ack", 1)
+	cancel()
+	waitClosed(t, done, "the stream to stop")
+	if strings.Contains(rec.Body.String(), "event: punch") {
+		t.Fatalf("stale punch event was delivered: %q", rec.Body.String())
+	}
+}
+
+func TestEventsStreamStopsOnWriteError(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{})
+	sid := registerRealm(t, s, "example")
+
+	rec := newFlushRecorder()
+	cancel, done := openEvents(t, s, "example", sid, failingWriter{rec}, rec)
+	defer cancel()
+	doRequest(t, s, http.MethodPost, "/v1/example/heartbeat", sid, map[string]any{})
+	// The request context is never canceled: the failed write alone has
+	// to end the stream.
+	waitClosed(t, done, "the stream to stop after a failed write")
+}
+
+func TestEventsStreamWithMetricsEnabled(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{})
+	s.metrics = newMetrics()
+	sid := registerRealm(t, s, "example")
+
+	rec := newFlushRecorder()
+	cancel, done := openEvents(t, s, "example", sid, rec, rec)
+	doRequest(t, s, http.MethodPost, "/v1/example/heartbeat", sid, map[string]any{})
+	waitForBody(t, rec, "event: heartbeat_ack", 1)
+	cancel()
+	waitClosed(t, done, "the stream to stop")
+}
+
+// failingWriter is a stream whose connection is gone: every write fails.
+type failingWriter struct{ *flushRecorder }
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+func TestDuplicateNonceIsRejected(t *testing.T) {
+	realmToken = testRealmToken
+	oldTimeout := connectResponseTimeout
+	connectResponseTimeout = 2 * time.Second
+	t.Cleanup(func() { connectResponseTimeout = oldTimeout })
+	s := newServer(serverConfig{})
+	sid := registerRealm(t, s, "example")
+
+	first := connectAsync(s, "example", testNonce)
+	waitFor(t, func() bool { return s.pendingConnects.Load() == 1 }, "the first connect to be pending")
+
+	dup := doRequest(t, s, http.MethodPost, "/v1/example/connect", testRealmToken, connectBody(testNonce))
+	if dup.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d, want %d", dup.Code, http.StatusConflict)
+	}
+	var er struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(dup.Body).Decode(&er)
+	if er.Error != errAttemptExists {
+		t.Fatalf("error code = %q, want %q", er.Error, errAttemptExists)
+	}
+
+	// The first attempt is unaffected.
+	resp := doRequest(t, s, http.MethodPost, "/v1/example/connects/"+testNonce, sid, map[string]any{
+		"addresses": []string{"198.51.100.1:9999"},
+	})
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("connect-response status = %d", resp.Code)
+	}
+	select {
+	case r := <-first:
+		if r.Code != http.StatusOK {
+			t.Fatalf("first connect status = %d", r.Code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first connect did not finish")
+	}
+}
+
+func TestCancelPendingKeepsNewerAttempt(t *testing.T) {
+	s := newServer(serverConfig{})
+	sess := &session{
+		id:      "session",
+		realmID: "example",
+		done:    make(chan struct{}),
+		pending: make(map[string]chan punchResponsePayload),
+	}
+	first, err := s.registerPending(sess, testNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.deliverPending(sess, testNonce, punchResponsePayload{}) {
+		t.Fatal("deliverPending failed")
+	}
+	// Delivery frees the nonce, and a newer connect takes it before the
+	// first connect has cleaned up.
+	second, err := s.registerPending(sess, testNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.cancelPending(sess, testNonce, first)
+	if sess.pending[testNonce] != second {
+		t.Fatal("cleaning up the first attempt removed the second attempt")
+	}
+	s.cancelPending(sess, testNonce, second)
+	if len(sess.pending) != 0 {
+		t.Fatalf("pending = %d entries, want 0", len(sess.pending))
+	}
+	if n := s.pendingConnects.Load(); n != 0 {
+		t.Fatalf("pendingConnects = %d, want 0", n)
+	}
+}
+
+func TestConnectRateLimitPerIP(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{connectRatePerIP: 2})
+
+	// The realm does not exist, so allowed requests fail fast with 404.
+	// They still count toward the limit.
+	for i := 0; i < 2; i++ {
+		if resp := doRequest(t, s, http.MethodPost, "/v1/missing/connect", testRealmToken, connectBody(testNonce)); resp.Code != http.StatusNotFound {
+			t.Fatalf("request %d status = %d, want 404", i, resp.Code)
+		}
+	}
+	resp := doRequest(t, s, http.MethodPost, "/v1/missing/connect", testRealmToken, connectBody(testNonce))
+	if resp.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.Code)
+	}
+	var er struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&er)
+	if er.Error != errRateLimited {
+		t.Fatalf("error code = %q, want %q", er.Error, errRateLimited)
+	}
+
+	// Another address has its own budget.
+	body, _ := json.Marshal(connectBody(testNonce))
+	req := httptest.NewRequest(http.MethodPost, "/v1/missing/connect", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testRealmToken)
+	req.RemoteAddr = "198.51.100.50:1234"
+	other := httptest.NewRecorder()
+	s.handle(other, req)
+	if other.Code != http.StatusNotFound {
+		t.Fatalf("other address status = %d, want 404", other.Code)
+	}
+}
+
+func TestIPRateLimiter(t *testing.T) {
+	l := newIPRateLimiter(60, 2) // one token per second, bursts of 2
+	now := time.Now()
+	if !l.allow("a", now) || !l.allow("a", now) {
+		t.Fatal("burst was limited")
+	}
+	if l.allow("a", now) {
+		t.Fatal("third request in the same instant was allowed")
+	}
+	if !l.allow("b", now) {
+		t.Fatal("another IP shared the first IP's bucket")
+	}
+	if !l.allow("a", now.Add(time.Second)) {
+		t.Fatal("no token after a second")
+	}
+	l.prune(now.Add(time.Minute))
+	if len(l.buckets) != 0 {
+		t.Fatalf("prune kept %d full buckets", len(l.buckets))
+	}
+	if newIPRateLimiter(0, 10) != nil {
+		t.Fatal("a rate of 0 should mean no limiter")
+	}
+	var unlimited *ipRateLimiter
+	if !unlimited.allow("a", now) {
+		t.Fatal("nil limiter refused a request")
+	}
+}
+
+func TestValidateAddresses(t *testing.T) {
+	for _, a := range []string{
+		"127.0.0.1:22",
+		"[::1]:443",
+		"0.0.0.0:443",
+		"[::]:443",
+		"224.0.0.1:5353",
+		"[ff02::1]:5353",
+		"255.255.255.255:9",
+		"169.254.1.1:443",
+		"[fe80::1]:443",
+		"[fe80::1%eth0]:443",
+		"[::ffff:127.0.0.1]:22",
+		"203.0.113.10:0",
+	} {
+		if err := validateAddresses([]string{a}); err == nil {
+			t.Errorf("%s was accepted", a)
+		}
+	}
+	for _, a := range []string{
+		"203.0.113.10:4433",
+		"[2001:db8::1]:4433",
+		"192.168.1.10:4433",
+		"10.0.0.5:4433",
+		"100.64.0.1:4433",
+	} {
+		if err := validateAddresses([]string{a}); err != nil {
+			t.Errorf("%s was rejected: %v", a, err)
+		}
+	}
+}
+
+func TestRegisterRejectsLoopbackAddress(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{})
+	resp := doRequest(t, s, http.MethodPost, "/v1/example", testRealmToken, map[string]any{
+		"addresses": []string{"127.0.0.1:4433"},
+	})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.Code)
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	cases := []struct {
+		name    string
+		remote  string
+		header  string
+		values  []string
+		trusted []netip.Prefix
+		want    string
+	}{
+		{name: "no header configured", remote: "203.0.113.1:5", values: []string{"1.1.1.1"}, want: "203.0.113.1"},
+		{name: "header missing", remote: "10.0.0.1:5", header: "X-Forwarded-For", want: "10.0.0.1"},
+		{name: "rightmost entry wins", remote: "10.0.0.1:5", header: "X-Forwarded-For", values: []string{"1.1.1.1, 203.0.113.99"}, want: "203.0.113.99"},
+		{name: "entry with port", remote: "10.0.0.1:5", header: "X-Forwarded-For", values: []string{"[2001:db8::5]:1234"}, want: "2001:db8::5"},
+		{name: "malformed rightmost entry", remote: "10.0.0.1:5", header: "X-Forwarded-For", values: []string{"1.1.1.1, nonsense"}, want: "10.0.0.1"},
+		{name: "multiple header lines", remote: "10.0.0.1:5", header: "X-Forwarded-For", values: []string{"1.1.1.1", "203.0.113.7"}, want: "203.0.113.7"},
+		{name: "untrusted peer", remote: "203.0.113.9:5", header: "X-Forwarded-For", values: []string{"1.1.1.1"}, trusted: trusted, want: "203.0.113.9"},
+		{name: "skips trusted hops", remote: "10.0.0.1:5", header: "X-Forwarded-For", values: []string{"1.1.1.1, 203.0.113.5, 10.0.0.2"}, trusted: trusted, want: "203.0.113.5"},
+		{name: "all hops trusted", remote: "10.0.0.1:5", header: "X-Forwarded-For", values: []string{"10.0.0.3, 10.0.0.2"}, trusted: trusted, want: "10.0.0.3"},
+		{name: "mapped IPv4 socket address", remote: "[::ffff:192.0.2.1]:5", want: "192.0.2.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tc.remote
+			for _, v := range tc.values {
+				r.Header.Add("X-Forwarded-For", v)
+			}
+			if got := clientIP(r, tc.header, tc.trusted); got != tc.want {
+				t.Fatalf("clientIP = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckRealmToken(t *testing.T) {
+	realmToken = testRealmToken
+	s := newServer(serverConfig{})
+	cases := map[string]bool{
+		testRealmToken:       true,
+		"":                   false,
+		"realm":              false,
+		testRealmToken + "x": false,
+		"Realm-token":        false,
+	}
+	for token, want := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/v1/example", nil)
+		r.Header.Set("Authorization", "Bearer "+token)
+		if got := s.checkRealmToken(r); got != want {
+			t.Errorf("token %q: got %v, want %v", token, got, want)
+		}
+	}
+}
+
+func TestParseConfigRejectsInvalidEnvValues(t *testing.T) {
+	t.Setenv("HYSTERIA_REALM_TOKEN", "token")
+	t.Setenv("HYSTERIA_REALM_MAX_REALMS_PER_IP", "ten")
+	if _, err := parseConfig(nil); err == nil {
+		t.Fatal("accepted a non-numeric HYSTERIA_REALM_MAX_REALMS_PER_IP")
+	}
+	t.Setenv("HYSTERIA_REALM_MAX_REALMS_PER_IP", "")
+	t.Setenv("HYSTERIA_REALM_DEBUG", "maybe")
+	if _, err := parseConfig(nil); err == nil {
+		t.Fatal("accepted a non-boolean HYSTERIA_REALM_DEBUG")
+	}
+}
+
+func TestParseConfigRequiresCertAndKeyTogether(t *testing.T) {
+	t.Setenv("HYSTERIA_REALM_TOKEN", "token")
+	if _, err := parseConfig([]string{"--cert", "a.crt"}); err == nil {
+		t.Fatal("accepted a certificate without a key")
+	}
+	if _, err := parseConfig([]string{"--key", "a.key"}); err == nil {
+		t.Fatal("accepted a key without a certificate")
+	}
+	if _, err := parseConfig([]string{"--cert", "a.crt", "--key", "a.key"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseConfigRequiresToken(t *testing.T) {
+	t.Setenv("HYSTERIA_REALM_TOKEN", "")
+	t.Setenv("HYSTERIA_REALM_TOKEN_FILE", "")
+	if _, err := parseConfig(nil); err == nil {
+		t.Fatal("accepted a config without a token")
+	}
+}
+
+func TestParseConfigTokenFile(t *testing.T) {
+	t.Setenv("HYSTERIA_REALM_TOKEN", "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("file-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := parseConfig([]string{"--token-file", path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Token != "file-token" {
+		t.Fatalf("token = %q, want %q", cfg.Token, "file-token")
+	}
+	if _, err := parseConfig([]string{"--token-file", path, "--token", "other"}); err == nil {
+		t.Fatal("accepted both a token and a token file")
+	}
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseConfig([]string{"--token-file", empty}); err == nil {
+		t.Fatal("accepted an empty token file")
+	}
+}
+
+func TestParseConfigRejectsNegativeLimits(t *testing.T) {
+	t.Setenv("HYSTERIA_REALM_TOKEN", "token")
+	for _, arg := range []string{"--max-realms=-1", "--max-realms-per-ip=-1", "--connect-rate-per-ip=-1"} {
+		if _, err := parseConfig([]string{arg}); err == nil {
+			t.Errorf("accepted %s", arg)
+		}
+	}
+}
+
+func TestCompileRealmNamePatternMatchesWholeName(t *testing.T) {
+	re, err := compileRealmNamePattern(`[a-z]+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !re.MatchString("abc") {
+		t.Fatal("pattern did not match abc")
+	}
+	for _, name := range []string{"abc1", "1abc", "ABC"} {
+		if re.MatchString(name) {
+			t.Errorf("pattern matched %q", name)
+		}
+	}
+	if _, err := compileRealmNamePattern(`(`); err == nil {
+		t.Fatal("accepted an invalid pattern")
+	}
+}
+
+func TestServerConfigTrustedProxies(t *testing.T) {
+	cfg := config{
+		RealmNamePattern:   defaultRealmNamePattern,
+		TrustedProxyHeader: "X-Forwarded-For",
+		TrustedProxies:     "10.0.0.0/8, 192.0.2.1",
+	}
+	sc, err := cfg.serverConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.0.2.1/32")}
+	if len(sc.trustedProxies) != len(want) || sc.trustedProxies[0] != want[0] || sc.trustedProxies[1] != want[1] {
+		t.Fatalf("trusted proxies = %v, want %v", sc.trustedProxies, want)
+	}
+	cfg.TrustedProxies = "nonsense"
+	if _, err := cfg.serverConfig(); err == nil {
+		t.Fatal("accepted an invalid trusted proxy")
+	}
+	cfg.TrustedProxies = "10.0.0.0/8"
+	cfg.TrustedProxyHeader = ""
+	if _, err := cfg.serverConfig(); err == nil {
+		t.Fatal("accepted trusted proxies without a trusted proxy header")
+	}
+}
+
+// connectAsync sends a connect request from another goroutine. It does not
+// use t, since t.Fatal must only be called from the test goroutine.
+func connectAsync(s *server, realm, nonce string) <-chan *httptest.ResponseRecorder {
+	out := make(chan *httptest.ResponseRecorder, 1)
+	body, _ := json.Marshal(connectBody(nonce))
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/"+realm+"/connect", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+testRealmToken)
+		resp := httptest.NewRecorder()
+		s.handle(resp, req)
+		out <- resp
+	}()
+	return out
+}
+
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func doRequest(t *testing.T, s *server, method, path, token string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	bs, err := json.Marshal(body)
@@ -771,6 +1304,7 @@ func waitForSSEData(t *testing.T, resp *flushRecorder) {
 
 type flushRecorder struct {
 	*httptest.ResponseRecorder
+	mu      sync.Mutex // guards the body while a handler is writing
 	flushed chan struct{}
 	wrote   chan struct{}
 	once    sync.Once
@@ -786,18 +1320,97 @@ func newFlushRecorder() *flushRecorder {
 }
 
 func (r *flushRecorder) Flush() {
+	r.mu.Lock()
 	r.ResponseRecorder.Flush()
+	r.mu.Unlock()
 	r.once.Do(func() {
 		close(r.flushed)
 	})
 }
 
 func (r *flushRecorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
 	n, err := r.ResponseRecorder.Write(b)
+	r.mu.Unlock()
 	if n > 0 {
 		r.write.Do(func() {
 			close(r.wrote)
 		})
 	}
 	return n, err
+}
+
+// body returns what the handler has written so far.
+func (r *flushRecorder) body() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Body.String()
+}
+
+// waitForBody waits until the body contains substr at least n times.
+func waitForBody(t *testing.T, r *flushRecorder, substr string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for strings.Count(r.body(), substr) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d x %q in stream; got %q", n, substr, r.body())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// openEvents starts an /events stream for the session and returns its
+// recorder, a cancel func, and a channel that closes when the handler
+// returns. It waits for the stream to start.
+func openEvents(t *testing.T, s *server, realm, sessionID string, w http.ResponseWriter, rec *flushRecorder) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/v1/"+realm+"/events", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+sessionID)
+	done := make(chan struct{})
+	go func() {
+		s.handle(w, req)
+		close(done)
+	}()
+	select {
+	case <-rec.flushed:
+	case <-time.After(time.Second):
+		t.Fatal("events stream did not start")
+	}
+	return cancel, done
+}
+
+// registerRealm registers realm and returns its session ID.
+func registerRealm(t *testing.T, s *server, realm string) string {
+	t.Helper()
+	resp := doRequest(t, s, http.MethodPost, "/v1/"+realm, testRealmToken, map[string]any{
+		"addresses": []string{"203.0.113.10:4433"},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var rb struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rb); err != nil {
+		t.Fatal(err)
+	}
+	return rb.SessionID
+}
+
+func connectBody(nonce string) map[string]any {
+	return map[string]any{
+		"addresses": []string{"198.51.100.20:4433"},
+		"nonce":     nonce,
+		"obfs":      testObfs,
+	}
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
 }

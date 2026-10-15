@@ -24,8 +24,10 @@ const (
 	errIPLimit         = "ip_limit_reached"
 	errRealmNotFound   = "realm_not_found"
 	errAttemptNotFound = "attempt_not_found"
+	errAttemptExists   = "attempt_exists"
 	errRateLimited     = "rate_limited"
 	errNotFound        = "not_found"
+	errInternal        = "internal_error"
 )
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
@@ -40,29 +42,87 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func clientIP(r *http.Request, header string) string {
-	if header != "" {
-		if v := r.Header.Get(header); v != "" {
-			if i := strings.Index(v, ","); i >= 0 {
-				v = v[:i]
-			}
-			v = strings.TrimSpace(v)
-			if h, _, err := net.SplitHostPort(v); err == nil {
-				v = h
-			}
-			if addr, err := netip.ParseAddr(v); err == nil {
-				return addr.Unmap().String()
-			}
+// clientIP returns the IP of the client that sent r.
+//
+// With a proxy header configured, the client is the rightmost entry of that
+// header that is not a trusted proxy. Proxies append the address they saw,
+// so entries further left were written by the client and can be anything.
+// When trusted proxies are configured, the header is only read on requests
+// that come from one of them.
+func clientIP(r *http.Request, header string, trusted []netip.Prefix) string {
+	remote, ok := parseIPOrHostPort(r.RemoteAddr)
+	if !ok {
+		host := r.RemoteAddr
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		return host
+	}
+	if header == "" || (len(trusted) > 0 && !inPrefixes(trusted, remote)) {
+		return remote.String()
+	}
+	var entries []string
+	for _, v := range r.Header.Values(header) {
+		entries = append(entries, strings.Split(v, ",")...)
+	}
+	client := remote
+	for i := len(entries) - 1; i >= 0; i-- {
+		addr, ok := parseIPOrHostPort(strings.TrimSpace(entries[i]))
+		if !ok {
+			break
+		}
+		client = addr
+		if len(trusted) == 0 || !inPrefixes(trusted, addr) {
+			break
 		}
 	}
-	host := r.RemoteAddr
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	return client.String()
+}
+
+// parseIPOrHostPort parses "ip" or "ip:port" (with brackets for IPv6).
+func parseIPOrHostPort(s string) (netip.Addr, bool) {
+	if addr, err := netip.ParseAddr(s); err == nil {
+		return addr.Unmap().WithZone(""), true
 	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return addr.Unmap().String()
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		return ap.Addr().Unmap().WithZone(""), true
 	}
-	return host
+	return netip.Addr{}, false
+}
+
+func inPrefixes(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTrustedProxies parses a comma-separated list of IPs and CIDRs.
+func parseTrustedProxies(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			p, err := netip.ParsePrefix(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid trusted proxy %q: %w", part, err)
+			}
+			out = append(out, p.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy %q: %w", part, err)
+		}
+		addr = addr.Unmap().WithZone("")
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
 }
 
 func bearer(r *http.Request) string {
@@ -85,8 +145,31 @@ func validateAddresses(addrs []string) error {
 		if err != nil || !ap.IsValid() {
 			return fmt.Errorf("invalid address: %s", a)
 		}
+		if !usablePeerAddr(ap) {
+			return fmt.Errorf("address cannot be used by a remote peer: %s", a)
+		}
 	}
 	return nil
+}
+
+var ipv4Broadcast = netip.AddrFrom4([4]byte{255, 255, 255, 255})
+
+// usablePeerAddr reports whether a peer on another network could reach
+// addr. Port 0, unspecified, loopback, link-local, multicast and broadcast
+// addresses never qualify. Accepting them would let anyone with the realm
+// token make a realm server send punch packets to itself, to its link-local
+// neighbors, or to multicast groups. Private ranges stay allowed, because
+// realms can run on private networks with a private STUN server.
+func usablePeerAddr(ap netip.AddrPort) bool {
+	if ap.Port() == 0 || ap.Addr().Zone() != "" {
+		return false
+	}
+	addr := ap.Addr().Unmap()
+	return !addr.IsUnspecified() &&
+		!addr.IsLoopback() &&
+		!addr.IsLinkLocalUnicast() &&
+		!addr.IsMulticast() &&
+		addr != ipv4Broadcast
 }
 
 func validateHexField(name, value string, length int) error {

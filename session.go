@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"net/netip"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -18,6 +21,22 @@ const (
 const (
 	eventsBufferSize   = 16
 	maxPendingAttempts = eventsBufferSize
+	// maxConnectBurst caps how many connect requests one IP can make
+	// back to back before the per-minute rate applies.
+	maxConnectBurst = 20
+)
+
+// punchEventMaxAge is how long a queued punch event is worth delivering.
+// After the connect wait times out the client still punches toward the
+// cached addresses for a while, so a late event can still help. Older events
+// are dropped instead of making the realm server punch at a client that has
+// given up.
+var punchEventMaxAge = 20 * time.Second
+
+var (
+	errSessionClosed = errors.New("session closed")
+	errPendingFull   = errors.New("too many in-flight connect attempts")
+	errNonceInUse    = errors.New("nonce already in use")
 )
 
 type session struct {
@@ -26,15 +45,24 @@ type session struct {
 	addresses []string
 	expires   time.Time
 	events    chan sessionEvent
-	done      chan struct{}
-	closed    bool
-	clientIP  string
-	pending   map[string]chan punchResponsePayload
+	// ack holds at most one pending heartbeat_ack, so acks never take
+	// buffer space away from punch events.
+	ack      chan struct{}
+	done     chan struct{}
+	closed   bool
+	clientIP string
+	pending  map[string]chan punchResponsePayload
+
+	// stream identifies the /events stream that owns the session, and
+	// streamCancel stops it. Only the newest stream receives events.
+	stream       uint64
+	streamCancel context.CancelFunc
 }
 
 type sessionEvent struct {
-	kind string
-	data any
+	kind   string
+	data   any
+	queued time.Time
 }
 
 type punchResponsePayload struct {
@@ -42,10 +70,12 @@ type punchResponsePayload struct {
 }
 
 type serverConfig struct {
-	maxRealms      int
-	maxRealmsPerIP int
-	proxyHeader    string
-	realmIDPattern *regexp.Regexp
+	maxRealms        int
+	maxRealmsPerIP   int
+	connectRatePerIP int // connect requests per minute per IP, 0 = unlimited
+	proxyHeader      string
+	trustedProxies   []netip.Prefix
+	realmIDPattern   *regexp.Regexp
 }
 
 type server struct {
@@ -53,10 +83,13 @@ type server struct {
 	realms         map[string]*session // realmID -> session
 	sessions       map[string]*session // sessionID -> session
 	ipCounts       map[string]int      // clientIP -> realm count
+	streamSeq      uint64
 	maxRealms      int
 	maxRealmsPerIP int
 	proxyHeader    string
+	trustedProxies []netip.Prefix
 	realmIDPattern *regexp.Regexp
+	connectLimiter *ipRateLimiter
 
 	metrics            *metrics
 	activeEventStreams atomic.Int64
@@ -75,7 +108,9 @@ func newServer(cfg serverConfig) *server {
 		maxRealms:      cfg.maxRealms,
 		maxRealmsPerIP: cfg.maxRealmsPerIP,
 		proxyHeader:    cfg.proxyHeader,
+		trustedProxies: cfg.trustedProxies,
 		realmIDPattern: pat,
+		connectLimiter: newIPRateLimiter(cfg.connectRatePerIP, min(cfg.connectRatePerIP, maxConnectBurst)),
 	}
 }
 
@@ -133,20 +168,22 @@ func (s *server) removeExpiredSession(sess *session, now time.Time) bool {
 	return true
 }
 
-func (s *server) registerPending(sess *session, nonce string) (chan punchResponsePayload, bool) {
+func (s *server) registerPending(sess *session, nonce string) (chan punchResponsePayload, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if sess.closed || len(sess.pending) >= maxPendingAttempts {
-		return nil, false
+	if sess.closed {
+		return nil, errSessionClosed
 	}
 	if _, exists := sess.pending[nonce]; exists {
-		// Nonce collision? Silently drop the attempt.
-		return nil, false
+		return nil, errNonceInUse
+	}
+	if len(sess.pending) >= maxPendingAttempts {
+		return nil, errPendingFull
 	}
 	ch := make(chan punchResponsePayload, 1)
 	sess.pending[nonce] = ch
 	s.pendingConnects.Add(1)
-	return ch, true
+	return ch, nil
 }
 
 func (s *server) deliverPending(sess *session, nonce string, payload punchResponsePayload) bool {
@@ -167,10 +204,15 @@ func (s *server) deliverPending(sess *session, nonce string, payload punchRespon
 	return true
 }
 
-func (s *server) cancelPending(sess *session, nonce string) {
+// cancelPending removes the pending entry that registerPending returned ch
+// for. Once a response is delivered the nonce is free again, so a newer
+// connect may already have registered it; that entry is left alone.
+func (s *server) cancelPending(sess *session, nonce string, ch chan punchResponsePayload) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(sess.pending, nonce)
+	if sess.pending[nonce] == ch {
+		delete(sess.pending, nonce)
+	}
 	s.pendingConnects.Add(-1)
 }
 
@@ -180,12 +222,75 @@ func (s *server) sendEvent(sess *session, ev sessionEvent) bool {
 	if sess.closed {
 		return false
 	}
+	ev.queued = time.Now()
 	select {
 	case sess.events <- ev:
 		return true
 	default:
 		return false
 	}
+}
+
+// requeueEvent puts back an event that a replaced stream received but did
+// not write.
+func (s *server) requeueEvent(sess *session, ev sessionEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess.closed {
+		return
+	}
+	select {
+	case sess.events <- ev:
+	default:
+	}
+}
+
+// sendAck queues a heartbeat_ack for the session's event stream. Acks are
+// coalesced: while one is waiting to be written, another adds nothing.
+func (s *server) sendAck(sess *session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess.closed {
+		return false
+	}
+	select {
+	case sess.ack <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// attachStream makes a new /events stream the owner of sess and stops the
+// stream that owned it before. A realm server only opens a new stream after
+// it has given up on the old one, which is usually a connection that died
+// without this server noticing; left running, it would keep taking events
+// and writing them into the dead connection.
+func (s *server) attachStream(parent context.Context, sess *session) (context.Context, uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess.closed {
+		return nil, 0, false
+	}
+	if sess.streamCancel != nil {
+		sess.streamCancel()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.streamSeq++
+	sess.stream = s.streamSeq
+	sess.streamCancel = cancel
+	return ctx, sess.stream, true
+}
+
+func (s *server) detachStream(sess *session, id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess.stream != id {
+		// Already replaced; the newer stream canceled this one.
+		return
+	}
+	sess.streamCancel()
+	sess.stream = 0
+	sess.streamCancel = nil
 }
 
 func (s *server) reaper() {
@@ -207,5 +312,6 @@ func (s *server) reaper() {
 				debugf("session expired realm=%s session=%s", sess.realmID, sess.id)
 			}
 		}
+		s.connectLimiter.prune(now)
 	}
 }

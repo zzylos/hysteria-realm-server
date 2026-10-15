@@ -40,26 +40,31 @@ Equivalent CLI flags are also supported:
   --key /path/to/key.pem
 ```
 
-If `HYSTERIA_REALM_CERT` and `HYSTERIA_REALM_KEY` are unset, the server runs over plain HTTP.
+If `HYSTERIA_REALM_CERT` and `HYSTERIA_REALM_KEY` are both unset, the server runs over plain HTTP. Setting only one of them is an error, so a typo can't silently turn TLS off.
+
+To keep the token out of the process list and shell history, put it in a file and use `HYSTERIA_REALM_TOKEN_FILE` (or `--token-file`) instead of `HYSTERIA_REALM_TOKEN`.
 
 ## Configuration
 
 | Variable                              | Default                            | Description                                                                                                                                                            |
 | ------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `HYSTERIA_REALM_LISTEN`               | `:8443`                            | Address to listen on                                                                                                                                                   |
-| `HYSTERIA_REALM_TOKEN`                | _REQUIRED_                         | Shared bearer token for realm registration and connection                                                                                                              |
-| `HYSTERIA_REALM_CERT`                 | _(none)_                           | Path to TLS certificate                                                                                                                                                |
-| `HYSTERIA_REALM_KEY`                  | _(none)_                           | Path to TLS private key                                                                                                                                                |
+| `HYSTERIA_REALM_TOKEN`                | _REQUIRED_                         | Shared bearer token for realm registration and connection. Required unless `HYSTERIA_REALM_TOKEN_FILE` is set.                                                         |
+| `HYSTERIA_REALM_TOKEN_FILE`           | _(none)_                           | File to read the token from (surrounding whitespace is trimmed). Use instead of `HYSTERIA_REALM_TOKEN`, not together with it.                                          |
+| `HYSTERIA_REALM_CERT`                 | _(none)_                           | Path to TLS certificate. Must be set together with `HYSTERIA_REALM_KEY`.                                                                                               |
+| `HYSTERIA_REALM_KEY`                  | _(none)_                           | Path to TLS private key. Must be set together with `HYSTERIA_REALM_CERT`.                                                                                              |
 | `HYSTERIA_REALM_DEBUG`                | `false`                            | Enable debug logs for registration, sessions, and punches                                                                                                              |
 | `HYSTERIA_REALM_MAX_REALMS`           | `65536`                            | Maximum total number of registered realms. `0` disables the limit.                                                                                                     |
 | `HYSTERIA_REALM_MAX_REALMS_PER_IP`    | `4`                                | Maximum realms per client IP. `0` disables the limit.                                                                                                                  |
+| `HYSTERIA_REALM_CONNECT_RATE_PER_IP`  | `60`                               | Maximum `connect` requests per minute from one client IP, with short bursts of up to 20 allowed. `0` disables the limit.                                               |
 | `HYSTERIA_REALM_TRUSTED_PROXY_HEADER` | _(none)_                           | Header to read the real client IP from when behind a reverse proxy or CDN (e.g. `X-Forwarded-For`, `CF-Connecting-IP`). Empty means use the connecting socket address. |
-| `HYSTERIA_REALM_NAME_PATTERN`         | `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` | Regex realm names must match.                                                                                                                                          |
+| `HYSTERIA_REALM_TRUSTED_PROXIES`      | _(none)_                           | Comma-separated IPs and CIDRs of your proxies (e.g. `10.0.0.0/8,192.0.2.1`). When set, the proxy header is only trusted on requests from these addresses.              |
+| `HYSTERIA_REALM_NAME_PATTERN`         | `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` | Regex realm names must match. It always has to match the whole name, even without `^` and `$`.                                                                         |
 | `HYSTERIA_REALM_METRICS_LISTEN`       | _(none)_                           | Address to expose Prometheus metrics on (e.g. `:9090`). Empty disables metrics.                                                                                        |
 
-CLI flags with the same meaning are available: `--listen`, `--token`, `--cert`, `--key`, `--debug`, `--max-realms`, `--max-realms-per-ip`, `--trusted-proxy-header`, `--realm-name-pattern`, and `--metrics-listen`. Flags override environment variables.
+CLI flags with the same meaning are available: `--listen`, `--token`, `--token-file`, `--cert`, `--key`, `--debug`, `--max-realms`, `--max-realms-per-ip`, `--connect-rate-per-ip`, `--trusted-proxy-header`, `--trusted-proxies`, `--realm-name-pattern`, and `--metrics-listen`. Flags override environment variables. Invalid values (for example a non-numeric limit) stop the server at startup instead of being ignored.
 
-When `HYSTERIA_REALM_TRUSTED_PROXY_HEADER` is set, the server takes the leftmost comma-separated value of that header as the client IP, falling back to the socket address if the header is missing or unparseable. Only enable this when the server is actually behind a trusted proxy that strips/sets the header — otherwise clients can spoof their IP and bypass the per-IP limit.
+When `HYSTERIA_REALM_TRUSTED_PROXY_HEADER` is set, the server reads the client IP from that header, falling back to the socket address if the header is missing or unparseable. Proxies add the address they saw to the **end** of headers like `X-Forwarded-For`, so the server uses the rightmost entry; anything to its left was sent by the client and could be made up. If requests pass through more than one proxy, list all of them in `HYSTERIA_REALM_TRUSTED_PROXIES`: the server then skips those addresses from the right and uses the first one that isn't a proxy. Setting `HYSTERIA_REALM_TRUSTED_PROXIES` also makes the server ignore the header on requests that don't come from a listed proxy. Without it, anyone who can reach the server directly can send the header and pick their own IP, bypassing the per-IP limits.
 
 ## Limitations
 
@@ -70,18 +75,22 @@ When `HYSTERIA_REALM_TRUSTED_PROXY_HEADER` is set, the server takes the leftmost
 
 All endpoints use `Authorization: Bearer ...`. Realm names in `{id}` must match `HYSTERIA_REALM_NAME_PATTERN`; an invalid name returns `400 bad_request`.
 
+Addresses must be `ip:port` pairs that a peer on another network could send packets to. Port `0`, unspecified (`0.0.0.0`, `::`), loopback, link-local, multicast and broadcast addresses are rejected with `400 bad_request`. Private ranges such as `10.0.0.0/8` are allowed.
+
 Errors are returned as JSON: `{"error": "<code>", "message": "<human-readable>"}`. Notable codes:
 
-| Status | Code                  | Cause                                                       |
-| ------ | --------------------- | ----------------------------------------------------------- |
-| 400    | `bad_request`         | Invalid JSON, invalid addresses/nonce/obfs, bad name        |
-| 401    | `invalid_token`       | Missing or wrong bearer token                               |
-| 404    | `realm_not_found`     | `connect` to a realm that is not registered                 |
-| 404    | `attempt_not_found`   | `connects/{nonce}` post for an unknown / expired nonce      |
-| 409    | `realm_taken`         | Registering a realm name that is already in use             |
-| 429    | `realm_limit_reached` | Global realm limit reached                                  |
-| 429    | `ip_limit_reached`    | Per-IP realm limit reached                                  |
-| 503    | `rate_limited`        | Server's punch event buffer or pending-attempts cap is full |
+| Status | Code                  | Cause                                                                           |
+| ------ | --------------------- | ------------------------------------------------------------------------------- |
+| 400    | `bad_request`         | Invalid JSON, invalid addresses/nonce/obfs, bad name                            |
+| 401    | `invalid_token`       | Missing or wrong bearer token                                                   |
+| 404    | `realm_not_found`     | `connect` to a realm that is not registered                                     |
+| 404    | `attempt_not_found`   | `connects/{nonce}` post for an unknown / expired nonce                          |
+| 409    | `realm_taken`         | Registering a realm name that is already in use                                 |
+| 409    | `attempt_exists`      | `connect` with a nonce that another in-flight `connect` already uses            |
+| 429    | `realm_limit_reached` | Global realm limit reached                                                      |
+| 429    | `ip_limit_reached`    | Per-IP realm limit reached                                                      |
+| 429    | `rate_limited`        | Too many `connect` requests from this IP (`HYSTERIA_REALM_CONNECT_RATE_PER_IP`) |
+| 503    | `rate_limited`        | Server's punch event buffer or pending-attempts cap is full                     |
 
 ### `POST /v1/{id}`
 
@@ -120,7 +129,9 @@ event: heartbeat_ack
 data: {"ttl":60}
 ```
 
-`punch` is emitted on every `connect` request for this realm. `heartbeat_ack` is emitted on every successful `heartbeat` and lets clients confirm the SSE stream is still healthy.
+`punch` is emitted on every `connect` request for this realm. `heartbeat_ack` is emitted after a successful `heartbeat` and lets clients confirm the SSE stream is still healthy. Acks are coalesced: while one is waiting to be sent, more heartbeats don't queue more acks, so they never crowd out `punch` events.
+
+Only one stream per session receives events. Opening a new stream closes the previous one, because a client only reconnects after giving up on its old connection, which may be dead without the server knowing. `punch` events that waited in the queue for more than 20 seconds (for example while no stream was open) are dropped instead of delivered, since the client has stopped waiting for them by then.
 
 ### `POST /v1/{id}/heartbeat`
 

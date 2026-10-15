@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,11 +57,18 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) checkRealmToken(r *http.Request) bool {
 	expected := realmToken
-	return expected != "" && bearer(r) == expected
+	if expected == "" {
+		return false
+	}
+	// Compare digests in constant time so response timing reveals
+	// neither the token's contents nor its length.
+	got := sha256.Sum256([]byte(bearer(r)))
+	want := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 func (s *server) requestIP(r *http.Request) string {
-	return clientIP(r, s.proxyHeader)
+	return clientIP(r, s.proxyHeader, s.trustedProxies)
 }
 
 func (s *server) realmID(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -126,6 +136,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		addresses: req.Addresses,
 		expires:   time.Now().Add(sessionTTL),
 		events:    make(chan sessionEvent, eventsBufferSize),
+		ack:       make(chan struct{}, 1),
 		done:      make(chan struct{}),
 		clientIP:  ip,
 		pending:   make(map[string]chan punchResponsePayload),
@@ -206,7 +217,7 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	debugf("heartbeat realm=%s session=%s addressesUpdated=%t remote=%s", id, sess.id, req.Addresses != nil, remote)
 	s.metrics.heartbeat("ok")
-	if !s.sendEvent(sess, sessionEvent{kind: "heartbeat_ack", data: map[string]any{"ttl": int(sessionTTL.Seconds())}}) {
+	if !s.sendAck(sess) {
 		debugf("heartbeat ack dropped realm=%s session=%s remote=%s", id, sess.id, remote)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ttl": int(sessionTTL.Seconds())})
@@ -224,36 +235,78 @@ func (s *server) events(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, errInvalidToken, "invalid session token")
 		return
 	}
-	debugf("events connected realm=%s session=%s remote=%s", id, sess.id, remote)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errBadRequest, "streaming not supported")
+	if _, ok := w.(http.Flusher); !ok {
+		writeErr(w, http.StatusInternalServerError, errInternal, "streaming not supported")
 		return
 	}
+	ctx, streamID, ok := s.attachStream(r.Context(), sess)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errInvalidToken, "invalid session token")
+		return
+	}
+	defer s.detachStream(sess, streamID)
+	debugf("events connected realm=%s session=%s remote=%s", id, sess.id, remote)
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		debugf("events write failed realm=%s session=%s remote=%s err=%v", id, sess.id, remote, err)
+		return
+	}
 
 	s.activeEventStreams.Add(1)
 	defer s.activeEventStreams.Add(-1)
 
-	ctx := r.Context()
 	for {
+		var ev sessionEvent
 		select {
 		case <-ctx.Done():
-			debugf("events disconnected realm=%s session=%s remote=%s", id, sess.id, remote)
+			if r.Context().Err() == nil {
+				debugf("events replaced by a newer stream realm=%s session=%s remote=%s", id, sess.id, remote)
+			} else {
+				debugf("events disconnected realm=%s session=%s remote=%s", id, sess.id, remote)
+			}
 			return
 		case <-sess.done:
 			debugf("events closed realm=%s session=%s remote=%s", id, sess.id, remote)
 			return
-		case ev := <-sess.events:
-			data, _ := json.Marshal(ev.data)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.kind, data)
-			flusher.Flush()
+		case <-sess.ack:
+			ev = sessionEvent{kind: "heartbeat_ack", data: map[string]any{"ttl": int(sessionTTL.Seconds())}}
+		case ev = <-sess.events:
+		}
+		if ctx.Err() != nil {
+			// A newer stream took over while this one was picking up the
+			// event. Hand it back so the new stream delivers it.
+			if ev.kind == "heartbeat_ack" {
+				s.sendAck(sess)
+			} else {
+				s.requeueEvent(sess, ev)
+			}
+			return
+		}
+		if ev.kind == "punch" && time.Since(ev.queued) > punchEventMaxAge {
+			debugf("events dropped stale punch realm=%s session=%s age=%s", id, sess.id, time.Since(ev.queued).Round(time.Second))
+			continue
+		}
+		if err := writeSSE(w, rc, ev); err != nil {
+			debugf("events write failed realm=%s session=%s remote=%s err=%v", id, sess.id, remote, err)
+			return
 		}
 	}
+}
+
+func writeSSE(w io.Writer, rc *http.ResponseController, ev sessionEvent) error {
+	data, err := json.Marshal(ev.data)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.kind, data); err != nil {
+		return err
+	}
+	return rc.Flush()
 }
 
 func (s *server) connect(w http.ResponseWriter, r *http.Request) {
@@ -290,6 +343,13 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 	}
 	s.metrics.connectRequest()
 
+	if !s.connectLimiter.allow(remote, time.Now()) {
+		debugf("connect rate limited (per-ip) realm=%s remote=%s", id, remote)
+		s.metrics.connectOutcome("ip_rate_limited")
+		writeErr(w, http.StatusTooManyRequests, errRateLimited, "too many connect requests from this address")
+		return
+	}
+
 	s.mu.Lock()
 	sess := s.realms[id]
 	if sess == nil || sess.closed || time.Now().After(sess.expires) {
@@ -304,14 +364,25 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 
 	// Register the pending entry BEFORE pushing the punch event,
 	// so a fast Hysteria server can never deliver before we're ready.
-	respCh, ok := s.registerPending(sess, req.Nonce)
-	if !ok {
+	respCh, err := s.registerPending(sess, req.Nonce)
+	switch {
+	case errors.Is(err, errSessionClosed):
+		debugf("connect realm not found realm=%s remote=%s", id, remote)
+		s.metrics.connectOutcome("no_realm")
+		writeErr(w, http.StatusNotFound, errRealmNotFound, "realm not registered")
+		return
+	case errors.Is(err, errNonceInUse):
+		debugf("connect nonce in use realm=%s session=%s remote=%s", id, sess.id, remote)
+		s.metrics.connectOutcome("nonce_in_use")
+		writeErr(w, http.StatusConflict, errAttemptExists, "a connect attempt with this nonce is already in flight")
+		return
+	case err != nil:
 		debugf("connect rate limited (pending) realm=%s session=%s remote=%s", id, sess.id, remote)
 		s.metrics.connectOutcome("rate_limited")
 		writeErr(w, http.StatusServiceUnavailable, errRateLimited, "too many in-flight connect attempts")
 		return
 	}
-	defer s.cancelPending(sess, req.Nonce)
+	defer s.cancelPending(sess, req.Nonce, respCh)
 
 	if s.sendEvent(sess, sessionEvent{kind: "punch", data: punchEvent{Addresses: req.Addresses, Nonce: req.Nonce, Obfs: req.Obfs}}) {
 		debugf("connect notified realm=%s session=%s clientAddresses=%d serverAddresses=%d remote=%s", id, sess.id, len(req.Addresses), len(serverAddrs), remote)
