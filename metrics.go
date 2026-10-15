@@ -68,7 +68,7 @@ func newMetrics() *metrics {
 	m.connectOutcomes = f.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Name:      "connect_outcomes_total",
-		Help:      "Connect attempts by outcome (delivered, timeout, no_realm, canceled, rate_limited, client_gave_up).",
+		Help:      "Connect attempts by outcome (delivered, timeout, no_realm, canceled, rate_limited, ip_rate_limited, nonce_in_use, client_gave_up).",
 	}, []string{"outcome"})
 	m.connectResponses = f.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -237,6 +237,16 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// FlushError lets http.ResponseController report write errors through the
+// recorder instead of losing them in Flush.
+func (r *statusRecorder) FlushError() error {
+	return http.NewResponseController(r.ResponseWriter).Flush()
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 func serveMetrics(addr string, reg *prometheus.Registry) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
@@ -244,6 +254,7 @@ func serveMetrics(addr string, reg *prometheus.Registry) {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 	log.Printf("metrics server listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil {
